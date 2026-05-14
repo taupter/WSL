@@ -8196,7 +8196,6 @@ class WSLCTests
         WSLCContainerLauncher launcher("debian:latest", "wslc-test-stats", {"sleep", "60"}, {}, WSLCContainerNetworkTypeBridged);
 
         auto runningContainer = launcher.Launch(*m_defaultSession, WSLCContainerStartFlagsNone);
-        auto cleanup = wil::scope_exit([&]() { runningContainer.SetDeleteOnClose(true); });
 
         wil::com_ptr<IWSLCContainer> container;
         VERIFY_SUCCEEDED(m_defaultSession->OpenContainer("wslc-test-stats", &container));
@@ -8279,7 +8278,6 @@ class WSLCTests
     {
         WSLCContainerLauncher launcher("debian:latest", "wslc-test-stats-null", {"sleep", "60"}, {}, WSLCContainerNetworkTypeBridged);
         auto runningContainer = launcher.Launch(*m_defaultSession, WSLCContainerStartFlagsNone);
-        auto cleanup = wil::scope_exit([&]() { runningContainer.SetDeleteOnClose(true); });
 
         wil::com_ptr<IWSLCContainer> container;
         VERIFY_SUCCEEDED(m_defaultSession->OpenContainer("wslc-test-stats-null", &container));
