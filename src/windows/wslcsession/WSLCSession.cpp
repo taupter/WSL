@@ -1704,7 +1704,7 @@ try
             for (int attempt = 0; attempt < c_maxNameRetries; attempt++)
             {
                 auto randomName = GenerateContainerName(attempt);
-                if (std::ranges::none_of(m_containers, [&](const auto& c) { return c->Name() == randomName; }))
+                if (std::ranges::none_of(m_containers, [&](const auto& entry) { return entry.second->Name() == randomName; }))
                 {
                     containerName = randomName;
                     break;
@@ -1721,7 +1721,7 @@ try
             }
         }
 
-        auto& it = m_containers.emplace_back(WSLCContainerImpl::Create(
+        auto container = WSLCContainerImpl::Create(
             *containerOptions,
             containerName,
             *this,
@@ -1730,9 +1730,13 @@ try
             std::bind(&WSLCSession::OnContainerDeleted, this, std::placeholders::_1),
             m_eventTracker.value(),
             m_dockerClient.value(),
-            m_ioRelay));
+            m_ioRelay);
 
-        it->CopyTo(Container);
+        // Key the map by Docker's container ID, which is set in the WSLCContainerImpl constructor and stable for its lifetime.
+        auto [it, inserted] = m_containers.emplace(container->ID(), std::move(container));
+        WI_ASSERT(inserted);
+
+        it->second->CopyTo(Container);
 
         return S_OK;
     }
@@ -1763,8 +1767,8 @@ try
     std::lock_guard containersLock{m_containersLock};
 
     // Purge containers that were auto-deleted via OnEvent (--rm).
-    std::erase_if(m_containers, [](const auto& e) { return e->State() == WslcContainerStateDeleted; });
-    auto it = std::ranges::find_if(m_containers, [Id](const auto& e) { return e->ID() == Id; });
+    std::erase_if(m_containers, [](const auto& entry) { return entry.second->State() == WslcContainerStateDeleted; });
+    auto it = m_containers.find(Id);
 
     // If no match is found, call Inspect() so that partial IDs and names are matched.
     if (it == m_containers.end())
@@ -1784,12 +1788,12 @@ try
             THROW_HR_MSG(E_FAIL, "Unexpected error inspecting container '%hs': %hs", Id, e.what());
         }
 
-        it = std::ranges::find_if(m_containers, [&](const auto& e) { return e->ID() == inspectResult.Id; });
+        it = m_containers.find(inspectResult.Id);
         RETURN_HR_IF_MSG(
             E_UNEXPECTED, it == m_containers.end(), "Resolved container ID (%hs -> %hs) not found", Id, inspectResult.Id.c_str());
     }
 
-    auto result = wil::ResultFromException([&]() { (*it)->CopyTo(Container); });
+    auto result = wil::ResultFromException([&]() { it->second->CopyTo(Container); });
 
     // Return WSLC_E_CONTAINER_NOT_FOUND if the container was found, but is being deleted for consistency.
     THROW_HR_WITH_USER_ERROR_IF(WSLC_E_CONTAINER_NOT_FOUND, Localization::MessageWslcContainerNotFound(Id), result == RPC_E_DISCONNECTED);
@@ -1798,28 +1802,71 @@ try
 }
 CATCH_RETURN();
 
-HRESULT WSLCSession::ListContainers(WSLCContainerEntry** Containers, ULONG* Count, WSLCContainerPortMapping** Ports, ULONG* PortsCount)
+HRESULT WSLCSession::ListContainers(
+    const WSLCListContainersOptions* Options, WSLCContainerEntry** Containers, ULONG* Count, WSLCContainerPortMapping** Ports, ULONG* PortsCount)
 try
 {
     COMServiceExecutionContext context;
+
+    RETURN_HR_IF_NULL(E_POINTER, Containers);
+    RETURN_HR_IF_NULL(E_POINTER, Count);
+    RETURN_HR_IF_NULL(E_POINTER, Ports);
+    RETURN_HR_IF_NULL(E_POINTER, PortsCount);
 
     *Count = 0;
     *Containers = nullptr;
     *Ports = nullptr;
     *PortsCount = 0;
 
+    bool all = false;
+    int limit = -1;
+    std::map<std::string, std::vector<std::string>> filters;
+
+    if (Options != nullptr)
+    {
+        THROW_HR_IF_MSG(
+            E_INVALIDARG,
+            WI_IsAnyFlagSet(static_cast<WSLCListContainersFlags>(Options->Flags), ~WSLCListContainersFlagsValid),
+            "Invalid flags: 0x%x",
+            Options->Flags);
+
+        all = WI_IsFlagSet(Options->Flags, WSLCListContainersFlagsAll);
+        limit = static_cast<int>(Options->Limit);
+
+        filters = wsl::windows::common::wslutil::ParseKeyMultiValuePairs(Options->Filters, Options->FiltersCount);
+    }
+
     auto lock = m_lock.lock_shared();
+    RETURN_HR_IF(HRESULT_FROM_WIN32(ERROR_INVALID_STATE), !m_dockerClient.has_value());
+
+    std::vector<docker_schema::ContainerInfo> dockerContainers;
+    try
+    {
+        dockerContainers = m_dockerClient->ListContainers(all, limit, filters);
+    }
+    CATCH_AND_THROW_DOCKER_USER_ERROR("Failed to list containers");
+
     std::lock_guard containersLock{m_containersLock};
 
     // Purge containers that were auto-deleted via OnEvent (--rm).
-    std::erase_if(m_containers, [](const auto& e) { return e->State() == WslcContainerStateDeleted; });
+    std::erase_if(m_containers, [](const auto& entry) { return entry.second->State() == WslcContainerStateDeleted; });
 
-    auto output = wil::make_unique_cotaskmem<WSLCContainerEntry[]>(m_containers.size());
+    // Allocate up to the Docker result count. The actual count (tracked via index) may be smaller
+    // if some IDs returned by Docker aren't in m_containers (e.g. created externally), but in the
+    // common case the two should match.
+    auto output = wil::make_unique_cotaskmem<WSLCContainerEntry[]>(dockerContainers.size());
     std::vector<WSLCContainerPortMapping> allPorts;
 
     size_t index = 0;
-    for (const auto& e : m_containers)
+    for (const auto& dockerContainer : dockerContainers)
     {
+        auto it = m_containers.find(dockerContainer.Id);
+        if (it == m_containers.end())
+        {
+            continue;
+        }
+
+        auto* e = it->second.get();
         THROW_HR_IF(E_UNEXPECTED, strcpy_s(output[index].Image, e->Image().c_str()) != 0);
         THROW_HR_IF(E_UNEXPECTED, strcpy_s(output[index].Name, e->Name().c_str()) != 0);
         THROW_HR_IF(E_UNEXPECTED, strcpy_s(output[index].Id, e->ID().c_str()) != 0);
@@ -1843,7 +1890,7 @@ try
         index++;
     }
 
-    *Count = static_cast<ULONG>(m_containers.size());
+    *Count = static_cast<ULONG>(index);
     *Containers = output.release();
 
     if (!allPorts.empty())
@@ -1858,7 +1905,7 @@ try
 }
 CATCH_RETURN();
 
-HRESULT WSLCSession::PruneContainers(_In_opt_ WSLCPruneLabelFilter* Filters, _In_ DWORD FiltersCount, _In_ ULONGLONG Until, _Out_ WSLCPruneContainersResults* Result)
+HRESULT WSLCSession::PruneContainers(_In_opt_ const WSLCFilter* Filters, _In_ ULONG FiltersCount, _Out_ WSLCPruneContainersResults* Result)
 try
 {
     COMServiceExecutionContext context;
@@ -1866,38 +1913,7 @@ try
     RETURN_HR_IF_NULL(E_POINTER, Result);
     ZeroMemory(Result, sizeof(*Result));
 
-    DockerHTTPClient::PruneContainersFilters filters;
-
-    if (FiltersCount > 0)
-    {
-        THROW_HR_IF(E_POINTER, FiltersCount > 0 && Filters == nullptr);
-
-        for (DWORD i = 0; i < FiltersCount; ++i)
-        {
-            THROW_HR_IF_MSG(E_POINTER, Filters[i].Key == nullptr, "Filter key cannot be null (index %lu)", i);
-            std::string labelFilter = Filters[i].Key;
-
-            if (Filters[i].Value != nullptr)
-            {
-                labelFilter += '=';
-                labelFilter += Filters[i].Value;
-            }
-
-            if (Filters[i].Present)
-            {
-                filters.presentLabels.emplace_back(std::move(labelFilter));
-            }
-            else
-            {
-                filters.absentLabels.emplace_back(std::move(labelFilter));
-            }
-        }
-    }
-
-    if (Until > 0)
-    {
-        filters.until = Until;
-    }
+    auto filters = wsl::windows::common::wslutil::ParseKeyMultiValuePairs(Filters, FiltersCount);
 
     auto lock = m_lock.lock_shared();
     RETURN_HR_IF(HRESULT_FROM_WIN32(ERROR_INVALID_STATE), !m_dockerClient.has_value());
@@ -1917,11 +1933,12 @@ try
     if (pruneResult.ContainersDeleted.has_value() && pruneResult.ContainersDeleted->size() > 0)
     {
         // Remove deleted containers from m_containers.
-        auto pred = [&](const auto& e) {
-            return std::ranges::find(pruneResult.ContainersDeleted.value(), e->ID()) != pruneResult.ContainersDeleted->end();
-        };
+        size_t erased = 0;
+        for (const auto& deletedId : pruneResult.ContainersDeleted.value())
+        {
+            erased += m_containers.erase(deletedId);
+        }
 
-        auto erased = std::erase_if(m_containers, pred);
         LOG_HR_IF_MSG(
             E_UNEXPECTED,
             erased != pruneResult.ContainersDeleted->size(),
@@ -2726,7 +2743,7 @@ void WSLCSession::OnContainerDeleted(const WSLCContainerImpl* Container)
     auto lock = m_lock.lock_shared();
     std::lock_guard containersLock(m_containersLock);
 
-    WI_VERIFY(std::erase_if(m_containers, [Container](const auto& e) { return e.get() == Container; }) == 1);
+    WI_VERIFY(m_containers.erase(Container->ID()) == 1);
 }
 
 HRESULT WSLCSession::GetState(_Out_ WSLCSessionState* State)
@@ -2757,7 +2774,8 @@ void WSLCSession::RecoverExistingContainers()
                 m_dockerClient.value(),
                 m_ioRelay);
 
-            m_containers.emplace_back(std::move(container));
+            auto [it, inserted] = m_containers.emplace(container->ID(), std::move(container));
+            WI_ASSERT(inserted);
         }
         catch (...)
         {

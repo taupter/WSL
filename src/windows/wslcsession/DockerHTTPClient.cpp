@@ -297,10 +297,18 @@ docker_schema::PruneImageResult DockerHTTPClient::PruneImages(const PruneImagesF
     return Transaction<docker_schema::EmptyRequest, docker_schema::PruneImageResult>(verb::post, url);
 }
 
-std::vector<docker_schema::ContainerInfo> DockerHTTPClient::ListContainers(bool all)
+std::vector<docker_schema::ContainerInfo> DockerHTTPClient::ListContainers(
+    bool all, int limit, const std::map<std::string, std::vector<std::string>>& filters)
 {
     auto url = URL::Create("/containers/json");
     url.SetParameter("all", all);
+    url.SetParameter("limit", std::to_string(limit));
+
+    if (!filters.empty())
+    {
+        nlohmann::json filtersJson = filters;
+        url.SetParameter("filters", filtersJson.dump());
+    }
 
     return Transaction<docker_schema::EmptyRequest, std::vector<docker_schema::ContainerInfo>>(verb::get, url);
 }
@@ -503,13 +511,13 @@ wil::unique_socket DockerHTTPClient::ContainerLogs(const std::string& Id, WSLCLo
     return std::move(socket);
 }
 
-docker_schema::PruneContainerResult DockerHTTPClient::PruneContainers(const PruneContainersFilters& filters)
+docker_schema::PruneContainerResult DockerHTTPClient::PruneContainers(const std::map<std::string, std::vector<std::string>>& filters)
 {
     auto url = URL::Create("/containers/prune");
 
-    auto filtersJson = PruneFiltersToJson(filters);
-    if (!filtersJson.empty())
+    if (!filters.empty())
     {
+        nlohmann::json filtersJson = filters;
         url.SetParameter("filters", filtersJson.dump());
     }
 
