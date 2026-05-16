@@ -85,7 +85,7 @@ public:
 
     // IWSLCSession - initialization methods
     IFACEMETHOD(GetProcessHandle)(_Out_ HANDLE* ProcessHandle) override;
-    IFACEMETHOD(Initialize)(_In_ const WSLCSessionInitSettings* Settings, _In_ IWSLCVirtualMachine* Vm) override;
+    IFACEMETHOD(Initialize)(_In_ const WSLCSessionInitSettings* Settings, _In_ IWSLCVirtualMachine* Vm, _In_ IWSLCPluginNotifier* PluginNotifier) override;
 
     IFACEMETHOD(GetId)(_Out_ ULONG* Id) override;
     IFACEMETHOD(GetState)(_Out_ WSLCSessionState* State) override;
@@ -177,7 +177,16 @@ private:
     __requires_lock_held(m_userCOMCallbacksLock) void CancelUserCOMCallbacks();
     void ConfigureStorage(const WSLCSessionInitSettings& Settings, PSID UserSid);
     void Ext4Format(const std::string& Device);
+    _Requires_shared_lock_held_(m_lock)
+    std::string InspectImageLockHeld(const std::string& Id);
     void OnContainerDeleted(const WSLCContainerImpl* Container);
+
+    _Requires_shared_lock_held_(m_lock)
+    void OnImageCreated(const std::string& ImageNameOrId) noexcept;
+
+    _Requires_shared_lock_held_(m_lock)
+    void OnImageDeleted(const std::string& ImageId) noexcept;
+
     void OnProcessLog(const gsl::span<char>& Data, PCSTR Source);
     void OnContainerdExited();
     void OnDockerdExited();
@@ -221,6 +230,8 @@ private:
     std::function<void()> m_destructionCallback;
     std::atomic<bool> m_terminating{false};
     std::atomic<bool> m_terminated{false};
+
+    wil::com_ptr<IWSLCPluginNotifier> m_pluginNotifier;
 
     // User-provided handles that the session is currently doing IO on.
     std::mutex m_userHandlesLock;

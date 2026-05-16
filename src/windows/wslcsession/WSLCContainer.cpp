@@ -579,6 +579,7 @@ WSLCPortMapping ContainerPortMapping::Serialize() const
 WSLCContainerImpl::WSLCContainerImpl(
     WSLCSession& wslcSession,
     WSLCVirtualMachine& virtualMachine,
+    IWSLCPluginNotifier* pluginNotifier,
     std::string&& Id,
     std::string&& Name,
     std::string&& Image,
@@ -595,6 +596,7 @@ WSLCContainerImpl::WSLCContainerImpl(
     WSLCProcessFlags InitProcessFlags,
     WSLCContainerFlags ContainerFlags) :
     m_wslcSession(wslcSession),
+    m_pluginNotifier(pluginNotifier),
     m_virtualMachine(virtualMachine),
     m_name(std::move(Name)),
     m_image(std::move(Image)),
@@ -851,6 +853,30 @@ void WSLCContainerImpl::Start(WSLCContainerStartFlags Flags, LPCSTR DetachKeys)
     }
     CATCH_AND_THROW_DOCKER_USER_ERROR("Failed to start container '%hs'", m_id.c_str());
 
+    auto inspectJson = InspectLockHeld();
+    const auto pluginResult = m_pluginNotifier->OnContainerStarted(inspectJson.c_str());
+    if (FAILED(pluginResult))
+    {
+        // Forward the COM error message, if available.
+        auto comError = wsl::windows::common::wslutil::GetCOMErrorInfo();
+
+        LOG_HR_MSG(pluginResult, "Plugin rejected start of container '%hs' (0x%x)", m_id.c_str(), pluginResult);
+        try
+        {
+            m_dockerClient.StopContainer(m_id.c_str(), {}, {});
+        }
+        CATCH_LOG();
+
+        if (comError.has_value() && comError->Message)
+        {
+            THROW_HR_WITH_USER_ERROR(pluginResult, comError->Message.get());
+        }
+        else
+        {
+            THROW_HR(pluginResult);
+        }
+    }
+
     portCleanup.release();
     volumeCleanup.release();
 
@@ -993,6 +1019,16 @@ void WSLCContainerImpl::Stop(WSLCSignal Signal, LONG TimeoutSeconds, bool Kill)
 __requires_exclusive_lock_held(m_lock) unique_com_disconnect WSLCContainerImpl::OnStopped(std::optional<std::uint64_t> stopTimestamp)
 {
     unique_com_disconnect comWrapper;
+
+    // Notify plugin manager that the container is stopping. Errors are ignored.
+    if (m_state == WslcContainerStateRunning)
+    {
+        try
+        {
+            LOG_IF_FAILED(m_pluginNotifier->OnContainerStopping(m_id.c_str()));
+        }
+        CATCH_LOG();
+    }
 
     ReleaseProcesses();
     ReleaseRuntimeResources();
@@ -1349,6 +1385,7 @@ std::unique_ptr<WSLCContainerImpl> WSLCContainerImpl::Create(
     const std::string& containerName,
     WSLCSession& wslcSession,
     WSLCVirtualMachine& virtualMachine,
+    IWSLCPluginNotifier* pluginNotifier,
     const std::unordered_map<std::string, NetworkEntry>& sessionNetworks,
     std::function<void(const WSLCContainerImpl*)>&& OnDeleted,
     DockerEventTracker& EventTracker,
@@ -1703,6 +1740,7 @@ std::unique_ptr<WSLCContainerImpl> WSLCContainerImpl::Create(
     auto container = std::make_unique<WSLCContainerImpl>(
         wslcSession,
         virtualMachine,
+        pluginNotifier,
         std::move(result.Id),
         CleanContainerName(inspectData.Name),
         std::string(containerOptions.Image),
@@ -1727,6 +1765,7 @@ std::unique_ptr<WSLCContainerImpl> WSLCContainerImpl::Open(
     const common::docker_schema::ContainerInfo& dockerContainer,
     WSLCSession& wslcSession,
     WSLCVirtualMachine& virtualMachine,
+    IWSLCPluginNotifier* pluginNotifier,
     WSLCVolumes& volumes,
     std::function<void(const WSLCContainerImpl*)>&& OnDeleted,
     DockerEventTracker& EventTracker,
@@ -1792,6 +1831,7 @@ std::unique_ptr<WSLCContainerImpl> WSLCContainerImpl::Open(
     auto container = std::make_unique<WSLCContainerImpl>(
         wslcSession,
         virtualMachine,
+        pluginNotifier,
         std::string(dockerContainer.Id),
         std::move(name),
         std::string(dockerContainer.Image),
@@ -1836,17 +1876,21 @@ void WSLCContainerImpl::Inspect(LPSTR* Output) const
 
     try
     {
-        // Get Docker inspect data
-        auto dockerInspect = m_dockerClient.InspectContainer(m_id);
-
-        // Convert to WSLC schema
-        auto wslcInspect = BuildInspectContainer(dockerInspect);
-
-        // Serialize WSLC schema to JSON
-        std::string wslcJson = wsl::shared::ToJson(wslcInspect);
-        *Output = wil::make_unique_ansistring<wil::unique_cotaskmem_ansistring>(wslcJson.c_str()).release();
+        *Output = wil::make_unique_ansistring<wil::unique_cotaskmem_ansistring>(InspectLockHeld().c_str()).release();
     }
     CATCH_AND_THROW_DOCKER_USER_ERROR("Failed to inspect container '%hs'", m_id.c_str());
+}
+
+std::string WSLCContainerImpl::InspectLockHeld() const
+{
+    // Get Docker inspect data
+    auto dockerInspect = m_dockerClient.InspectContainer(m_id);
+
+    // Convert to WSLC schema
+    auto wslcInspect = BuildInspectContainer(dockerInspect);
+
+    // Serialize WSLC schema to JSON
+    return wsl::shared::ToJson(wslcInspect);
 }
 
 void WSLCContainerImpl::Logs(WSLCLogsFlags Flags, WSLCHandle* Stdout, WSLCHandle* Stderr, ULONGLONG Since, ULONGLONG Until, ULONGLONG Tail) const
